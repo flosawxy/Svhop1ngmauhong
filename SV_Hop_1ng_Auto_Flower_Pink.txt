@@ -1,0 +1,882 @@
+--[[================================================================
+    🌸 SV Hop 1ng • AUTO BACKGROUND
+    Server Hop • Không giao diện • Kiểm tra định kỳ 60 giây
+
+    - Chỉ đọc danh sách server CÔNG KHAI của Roblox:
+        https://games.roblox.com/v1/games/{placeId}/servers/Public
+      và teleport bằng TeleportService (API chính thức của Roblox).
+    - Không gửi bất kỳ dữ liệu người chơi nào đến nơi khác.
+    - Logic: nếu server hiện tại có từ 3 người trở lên, tìm server công khai có đúng 1 người.
+      Nếu server hiện tại chỉ có 1–2 người, giữ nguyên và không gọi API tìm server.
+
+    Lưu ý: đã chỉnh mã nguồn, chưa chạy thử trong Roblox thực tế.
+    Có giới hạn tần suất, backoff và cache nhằm giảm request dư thừa.
+================================================================]]
+
+-- // Chống chạy trùng lần 2
+local GENV = _G
+pcall(function()
+    if type(getgenv) == "function" then GENV = getgenv() end
+end)
+if GENV.__NUOIBUNG_SVHUB_RUNNING then return end
+GENV.__NUOIBUNG_SVHUB_RUNNING = true
+
+local function MAIN()
+    local Players            = game:GetService("Players")
+    local TeleportService    = game:GetService("TeleportService")
+    local HttpService        = game:GetService("HttpService")
+    local UserInputService   = game:GetService("UserInputService")
+    local MarketplaceService = game:GetService("MarketplaceService")
+
+    local LocalPlayer = Players.LocalPlayer
+    while not LocalPlayer do
+        task.wait()
+        LocalPlayer = Players.LocalPlayer
+    end
+
+    local PlaceId = game.PlaceId
+
+    -- // Cấu hình
+    local CONFIG = {
+        MIN_FETCH_INTERVAL = 3,   -- giây tối thiểu giữa 2 lần gọi API (chống 429)
+        MAX_PAGES_PER_SCAN = 10,  -- quét tối đa 10 trang; mỗi trang API có thể trả tối đa 100 server
+        PAGE_DELAY         = 1.5, -- nghỉ giữa các trang
+        RETRY_MAX          = 2,   -- số lần thử lại khi gặp 429/5xx
+        RETRY_BASE         = 2,   -- backoff cơ bản (giây)
+        HOP_COOLDOWN       = 15,  -- nghỉ tối thiểu giữa các lần thử hop
+        AUTO_CHECK_INTERVAL= 60,  -- chỉ kiểm tra số người mỗi 60 giây
+        CACHE_TIME         = 45,  -- cache ngắn hơn chu kỳ kiểm tra để tránh dùng kết quả cũ
+        NO_RESULT_BACKOFF  = 60,  -- không tìm thấy server thì chờ thêm trước lần quét kế tiếp
+    }
+
+    -- // Bảng màu FULL HỒNG
+    local THEME = {
+        BG           = Color3.fromRGB(255, 214, 232), -- nền hồng nhạt
+        CARD         = Color3.fromRGB(255, 240, 247), -- card gần trắng hồng
+        CARD_STROKE  = Color3.fromRGB(255, 170, 205),
+        HEADER_1     = Color3.fromRGB(255, 105, 180), -- hot pink
+        HEADER_2     = Color3.fromRGB(255, 64, 150),
+        ACCENT       = Color3.fromRGB(200, 20, 110),
+        TEXT_MAIN    = Color3.fromRGB(96, 20, 56),    -- chữ chính
+        TEXT_SUB     = Color3.fromRGB(150, 60, 100),  -- chữ phụ
+        WHITE        = Color3.fromRGB(255, 255, 255),
+        OK           = Color3.fromRGB(0, 140, 90),    -- xanh thành công
+        WAIT         = Color3.fromRGB(190, 110, 0),   -- cam chờ
+        ERR          = Color3.fromRGB(200, 20, 60),   -- đỏ lỗi
+        BTN_HOP      = Color3.fromRGB(255, 64, 150),
+        BTN_HOP_HOV  = Color3.fromRGB(255, 100, 175),
+        BTN_AUTO_OFF = Color3.fromRGB(255, 140, 190),
+        BTN_AUTO_ON  = Color3.fromRGB(215, 20, 105),
+    }
+
+    -- // Tên game (API công khai, có pcall dự phòng)
+    local gameName = "Không xác định"
+    pcall(function()
+        gameName = MarketplaceService:GetProductInfo(PlaceId).Name or gameName
+    end)
+
+    -- // Helper tạo instance
+    local function make(class, props, parent)
+        local inst = Instance.new(class)
+        if props then
+            for k, v in pairs(props) do
+                inst[k] = v
+            end
+        end
+        inst.Parent = parent
+        return inst
+    end
+    local function corner(r, parent)
+        return make("UICorner", { CornerRadius = UDim.new(0, r) }, parent)
+    end
+    local function stroke(color, th, parent)
+        return make("UIStroke", { Color = color, Thickness = th, Transparency = 0.15 }, parent)
+    end
+
+    -- =================== GUI ===================
+    -- Dọn bản cũ nếu script được chạy lại sau khi cờ chống trùng bị reset.
+    local function removeOldGui(parent)
+        if not parent then return end
+        pcall(function()
+            local old = parent:FindFirstChild("NuoiBungSVHub")
+            if old then old:Destroy() end
+        end)
+    end
+
+    local ScreenGui = Instance.new("ScreenGui")
+    ScreenGui.Name = "NuoiBungSVHub"
+    ScreenGui.ResetOnSpawn = false
+    ScreenGui.DisplayOrder = 9999
+    ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    ScreenGui.Enabled = true
+
+    local guiParented = false
+    local function tryParent(parent)
+        if not parent then return false end
+        local ok = pcall(function()
+            removeOldGui(parent)
+            ScreenGui.Parent = parent
+        end)
+        return ok and ScreenGui.Parent == parent
+    end
+
+    -- Thử các môi trường thường gặp, không để lỗi CoreGui làm mất UI.
+    if type(gethui) == "function" then
+        local ok, hui = pcall(gethui)
+        if ok and hui then guiParented = tryParent(hui) end
+    end
+    if not guiParented and syn and type(syn.protect_gui) == "function" then
+        pcall(syn.protect_gui, ScreenGui)
+        local ok, coreGui = pcall(function()
+            return game:GetService("CoreGui")
+        end)
+        if ok and coreGui then guiParented = tryParent(coreGui) end
+    end
+    if not guiParented then
+        local ok, coreGui = pcall(function()
+            return game:GetService("CoreGui")
+        end)
+        if ok and coreGui then guiParented = tryParent(coreGui) end
+    end
+    if not guiParented then
+        local ok, playerGui = pcall(function()
+            return LocalPlayer:WaitForChild("PlayerGui", 5)
+        end)
+        if ok and playerGui then guiParented = tryParent(playerGui) end
+    end
+    if not guiParented then
+        ScreenGui:Destroy()
+        error("Không thể đặt ScreenGui vào gethui, CoreGui hoặc PlayerGui.")
+    end
+
+    local OPEN_SIZE   = UDim2.new(0, 320, 0, 205)
+    local CLOSED_SIZE = OPEN_SIZE
+
+    local MainFrame = make("Frame", {
+        Size = OPEN_SIZE,
+        Position = UDim2.new(0.5, -160, 0, 24),
+        BackgroundColor3 = THEME.BG,
+        BorderSizePixel = 0,
+        Active = true,
+        ClipsDescendants = true,
+    }, ScreenGui)
+    corner(16, MainFrame)
+    stroke(THEME.HEADER_1, 2, MainFrame)
+
+    -- Nút logo ninja nổi: luôn còn trên màn hình để mở/ẩn cửa sổ chính.
+    -- Dùng TextButton để không phụ thuộc URL/asset bên ngoài.
+    local NinjaToggle = make("TextButton", {
+        Name = "NinjaToggle",
+        Size = UDim2.new(0, 58, 0, 58),
+        Position = UDim2.new(0, 18, 0, 170),
+        BackgroundColor3 = Color3.fromRGB(255, 105, 180),
+        BorderSizePixel = 0,
+        AutoButtonColor = true,
+        Text = "🌸",
+        TextColor3 = THEME.WHITE,
+        TextSize = 30,
+        Font = Enum.Font.GothamBold,
+        ZIndex = 100,
+        Active = true,
+    }, ScreenGui)
+    corner(29, NinjaToggle)
+    stroke(Color3.fromRGB(255, 190, 220), 2, NinjaToggle)
+
+    -- Bản tự động: không còn menu/nút hoa nổi.
+    NinjaToggle.Visible = false
+    NinjaToggle.Active = false
+
+    -- Header hồng đậm (gradient)
+    local Header = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 64),
+        BackgroundColor3 = THEME.HEADER_1,
+        BorderSizePixel = 0,
+    }, MainFrame)
+    corner(16, Header)
+    make("Frame", { -- vá góc dưới cho vuông
+        Size = UDim2.new(1, 0, 0, 18),
+        Position = UDim2.new(0, 0, 1, -18),
+        BackgroundColor3 = THEME.HEADER_1,
+        BorderSizePixel = 0,
+    }, Header)
+    make("UIGradient", {
+        Color = ColorSequence.new(THEME.HEADER_1, THEME.HEADER_2),
+        Rotation = 12,
+    }, Header)
+
+    make("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.new(0, 16, 0, 8),
+        Size = UDim2.new(1, -104, 0, 26),
+        Font = Enum.Font.GothamBlack,
+        Text = "🌸 SV Hop 1ng • AUTO",
+        TextColor3 = THEME.WHITE,
+        TextSize = 18,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, Header)
+
+    make("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.new(0, 16, 0, 36),
+        Size = UDim2.new(1, -104, 0, 18),
+        Font = Enum.Font.Gotham,
+        Text = gameName .. " • PlaceId " .. tostring(PlaceId),
+        TextColor3 = Color3.fromRGB(255, 224, 238),
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, Header)
+
+    local MinBtn = make("TextButton", {
+        Position = UDim2.new(1, -72, 0, 12),
+        Size = UDim2.new(0, 26, 0, 26),
+        BackgroundColor3 = Color3.fromRGB(255, 140, 190),
+        BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold,
+        Text = "–",
+        TextColor3 = THEME.WHITE,
+        TextSize = 16,
+    }, Header)
+    corner(8, MinBtn)
+
+    local CloseBtn = make("TextButton", {
+        Position = UDim2.new(1, -38, 0, 12),
+        Size = UDim2.new(0, 26, 0, 26),
+        BackgroundColor3 = Color3.fromRGB(235, 40, 110),
+        BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold,
+        Text = "✕",
+        TextColor3 = THEME.WHITE,
+        TextSize = 13,
+    }, Header)
+    corner(8, CloseBtn)
+
+    -- Nội dung
+    local Content = make("Frame", {
+        Position = UDim2.new(0, 10, 0, 70),
+        Size = UDim2.new(1, -20, 0, 125),
+        BackgroundTransparency = 1,
+    }, MainFrame)
+
+    -- Card server hiện tại
+    local NowCard = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 52),
+        BackgroundColor3 = THEME.CARD,
+        BorderSizePixel = 0,
+    }, Content)
+    corner(12, NowCard)
+    stroke(THEME.CARD_STROKE, 1.5, NowCard)
+
+    local NowLabel = make("TextLabel", {
+        Position = UDim2.new(0, 12, 0, 4),
+        Size = UDim2.new(1, -24, 0, 24),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Text = "👥 Đang tải…",
+        TextColor3 = THEME.TEXT_MAIN,
+        TextSize = 18,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, NowCard)
+
+    local JobIdLabel = make("TextLabel", {
+        Position = UDim2.new(0, 12, 0, 29),
+        Size = UDim2.new(1, -24, 0, 16),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Code,
+        Text = "Mã server: …",
+        TextColor3 = THEME.TEXT_SUB,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, NowCard)
+
+    -- Card trạng thái
+    local StatusCard = make("Frame", {
+        Position = UDim2.new(0, 0, 0, 60),
+        Size = UDim2.new(1, 0, 0, 120),
+        BackgroundColor3 = THEME.CARD,
+        BorderSizePixel = 0,
+    }, Content)
+    corner(12, StatusCard)
+    stroke(THEME.CARD_STROKE, 1.5, StatusCard)
+
+    make("TextLabel", {
+        Position = UDim2.new(0, 12, 0, 6),
+        Size = UDim2.new(1, -24, 0, 16),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Text = "TRẠNG THÁI",
+        TextColor3 = THEME.TEXT_SUB,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, StatusCard)
+
+    local StatusLabel = make("TextLabel", {
+        Position = UDim2.new(0, 12, 0, 24),
+        Size = UDim2.new(1, -24, 0, 58),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham,
+        Text = "Sẵn sàng.",
+        TextColor3 = THEME.TEXT_SUB,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        TextWrapped = true,
+    }, StatusCard)
+
+    -- Card giới hạn người
+    local MaxCard = make("Frame", {
+        Position = UDim2.new(0, 0, 0, 182),
+        Size = UDim2.new(1, 0, 0, 66),
+        BackgroundColor3 = THEME.CARD,
+        BorderSizePixel = 0,
+    }, Content)
+    corner(12, MaxCard)
+    stroke(THEME.CARD_STROKE, 1.5, MaxCard)
+
+    make("TextLabel", {
+        Position = UDim2.new(0, 14, 0, 8),
+        Size = UDim2.new(1, -28, 0, 20),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Text = "Hop khi server hiện tại có NHIỀU HƠN:",
+        TextColor3 = THEME.TEXT_MAIN,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, MaxCard)
+
+    local MaxBox = make("TextBox", {
+        Position = UDim2.new(0, 14, 0, 34),
+        Size = UDim2.new(0, 90, 0, 26),
+        BackgroundColor3 = THEME.BG,
+        BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold,
+        Text = "1",
+        TextColor3 = THEME.TEXT_MAIN,
+        TextSize = 14,
+        ClearTextOnFocus = false,
+    }, MaxCard)
+    corner(8, MaxBox)
+    stroke(THEME.CARD_STROKE, 1, MaxBox)
+
+    make("TextLabel", {
+        Position = UDim2.new(0, 112, 0, 34),
+        Size = UDim2.new(1, -126, 0, 26),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham,
+        Text = "người → đặt 1 = tìm server 1 người",
+        TextColor3 = THEME.TEXT_SUB,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Left,
+    }, MaxCard)
+
+    -- Nút chính
+    local HopBtn = make("TextButton", {
+        Position = UDim2.new(0, 0, 0, 258),
+        Size = UDim2.new(0.5, -5, 0, 48),
+        BackgroundColor3 = THEME.BTN_HOP,
+        BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold,
+        Text = "🌸 Hop ngay",
+        TextColor3 = THEME.WHITE,
+        TextSize = 15,
+    }, Content)
+    corner(12, HopBtn)
+    stroke(THEME.HEADER_2, 1.5, HopBtn)
+
+    local AutoBtn = make("TextButton", {
+        Position = UDim2.new(0.5, 5, 0, 258),
+        Size = UDim2.new(0.5, -5, 0, 48),
+        BackgroundColor3 = THEME.BTN_AUTO_OFF,
+        BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold,
+        Text = "▶ Auto Hop: TẮT",
+        TextColor3 = THEME.WHITE,
+        TextSize = 15,
+    }, Content)
+    corner(12, AutoBtn)
+    stroke(THEME.HEADER_2, 1.5, AutoBtn)
+
+    local RefreshBtn = make("TextButton", {
+        Position = UDim2.new(0, 0, 0, 314),
+        Size = UDim2.new(1, 0, 0, 30),
+        BackgroundColor3 = THEME.CARD,
+        BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold,
+        Text = "🔄 Quét lại danh sách (xóa cache)",
+        TextColor3 = THEME.TEXT_MAIN,
+        TextSize = 12,
+    }, Content)
+    corner(8, RefreshBtn)
+    stroke(THEME.CARD_STROKE, 1, RefreshBtn)
+
+    make("TextLabel", {
+        Position = UDim2.new(0, 0, 0, 350),
+        Size = UDim2.new(1, 0, 0, 44),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham,
+        Text = "• Dùng cho mọi game (tự nhận PlaceId hiện tại)\n• Chỉ đọc danh sách server công khai của Roblox + teleport\n• Không tìm được server 1 người? Thử tăng giới hạn lên 2–5.",
+        TextColor3 = THEME.TEXT_SUB,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        TextWrapped = true,
+    }, Content)
+
+    -- Bảng trạng thái tối giản: ẩn các điều khiển/menu cũ.
+    MaxCard.Visible = false
+    HopBtn.Visible = false
+    AutoBtn.Visible = false
+    RefreshBtn.Visible = false
+    Content:FindFirstChildOfClass("TextLabel").Visible = false -- dòng hướng dẫn cuối nếu tìm thấy
+    MinBtn.Visible = false
+    CloseBtn.Visible = false
+    Header.Size = UDim2.new(1, 0, 0, 64)
+    Content.Size = UDim2.new(1, -20, 0, 125)
+    MainFrame.ClipsDescendants = true
+
+    -- // Kéo thả cửa sổ
+    do
+        local dragging = false
+        local dragStart, startPos
+        MainFrame.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                dragging = true
+                dragStart = input.Position
+                startPos = MainFrame.Position
+                input.Changed:Connect(function()
+                    if input.UserInputState == Enum.UserInputState.End then
+                        dragging = false
+                    end
+                end)
+            end
+        end)
+        UserInputService.InputChanged:Connect(function(input)
+            if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+                or input.UserInputType == Enum.UserInputType.Touch) then
+                local delta = input.Position - dragStart
+                MainFrame.Position = UDim2.new(
+                    startPos.X.Scale, startPos.X.Offset + delta.X,
+                    startPos.Y.Scale, startPos.Y.Offset + delta.Y
+                )
+            end
+        end)
+    end
+
+    -- =================== LOGIC ===================
+    local running = true
+    local hopInProgress = false
+    local lastHopAttempt = -math.huge
+    local autoEnabled = true
+    local autoGen = 0
+    local nextScanAllowedAt = 0
+    local updateAutoBtn -- khai báo trước để hopOnce dùng được
+
+    local function setStatus(text, color)
+        StatusLabel.Text = text
+        StatusLabel.TextColor3 = color or THEME.TEXT_SUB
+    end
+
+    local function playerCount()
+        return #Players:GetPlayers()
+    end
+
+    local function refreshNow()
+        NowLabel.Text = ("👥 Server hiện tại: %d / %d người"):format(playerCount(), Players.MaxPlayers)
+    end
+    Players.PlayerAdded:Connect(refreshNow)
+    Players.PlayerRemoving:Connect(refreshNow)
+
+    local jid = tostring(game.JobId)
+    if jid == "" then jid = "(không có — Studio?)" end
+    JobIdLabel.Text = "Mã server: " .. jid:sub(1, 28) .. (#jid > 28 and "…" or "")
+
+    -- // HTTP adapter: có pcall, kiểm tra status code, backoff khi 429/5xx
+    local httpRequest = (syn and syn.request) or http_request or request or (http and http.request)
+    local lastFetchTime = 0
+
+    local function httpGetJson(url, onNote)
+        local remain = CONFIG.MIN_FETCH_INTERVAL - (os.clock() - lastFetchTime)
+        if remain > 0 then
+            task.wait(remain)
+        end
+        lastFetchTime = os.clock()
+
+        if httpRequest then
+            local attempt = 0
+            while attempt <= CONFIG.RETRY_MAX do
+                local ok, res = pcall(httpRequest, {
+                    Url = url,
+                    Method = "GET",
+                    Headers = { ["Accept"] = "application/json" },
+                })
+                if not ok or type(res) ~= "table" then
+                    return nil, "Executor không gửi được request HTTP"
+                end
+                local code = tonumber(res.StatusCode) or tonumber(res.Status) or 0
+                if code == 200 then
+                    if type(res.Body) == "string" and res.Body ~= "" then
+                        local okJson, data = pcall(HttpService.JSONDecode, HttpService, res.Body)
+                        if okJson and type(data) == "table" then
+                            return data, nil
+                        end
+                        return nil, "Dữ liệu trả về không phải JSON hợp lệ"
+                    end
+                    return nil, "Phản hồi rỗng từ Roblox"
+                elseif code == 429 then
+                    if attempt >= CONFIG.RETRY_MAX then
+                        return nil, "Bị Roblox giới hạn request (429) — thử lại sau ít phút"
+                    end
+                    local backoff = CONFIG.RETRY_BASE * (attempt + 1)
+                    if onNote then
+                        onNote(("⚠ Bị giới hạn 429 — chờ %ds rồi thử lại…"):format(backoff), THEME.WAIT)
+                    end
+                    task.wait(backoff)
+                    attempt = attempt + 1
+                elseif code >= 500 then
+                    if attempt >= CONFIG.RETRY_MAX then
+                        return nil, "Lỗi máy chủ Roblox (HTTP " .. tostring(code) .. ")"
+                    end
+                    task.wait(CONFIG.RETRY_BASE * (attempt + 1))
+                    attempt = attempt + 1
+                else
+                    return nil, "Lỗi HTTP " .. tostring(code)
+                end
+            end
+            return nil, "Không lấy được danh sách server"
+        end
+
+        -- Dự phòng khi executor không có request()
+        local okGet, raw = pcall(function()
+            return game:HttpGet(url)
+        end)
+        if not okGet or type(raw) ~= "string" or raw == "" then
+            return nil, "Executor không hỗ trợ HTTP — không lấy được danh sách server"
+        end
+        local okJson, data = pcall(HttpService.JSONDecode, HttpService, raw)
+        if not okJson or type(data) ~= "table" then
+            return nil, "Dữ liệu trả về không phải JSON hợp lệ"
+        end
+        return data, nil
+    end
+
+    -- // Quét danh sách server (nhiều trang, có cache)
+    local cache = { candidates = nil, threshold = nil, scanned = 0, at = 0 }
+
+    local function scanServers(threshold, onNote)
+        if cache.candidates and cache.threshold == threshold
+            and (os.clock() - cache.at) < CONFIG.CACHE_TIME then
+            return cache.candidates, nil, cache.scanned
+        end
+
+        local candidates = {}
+        local scanned = 0
+        local cursor = nil
+
+        for page = 1, CONFIG.MAX_PAGES_PER_SCAN do
+            local url = ("https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Asc&limit=100"):format(PlaceId)
+            if cursor then
+                url = url .. "&cursor=" .. HttpService:UrlEncode(cursor)
+            end
+            if onNote then
+                onNote(("Đang quét danh sách server (trang %d/%d)…"):format(page, CONFIG.MAX_PAGES_PER_SCAN), THEME.WAIT)
+            end
+
+            local data, err = httpGetJson(url, onNote)
+            if not data then
+                if #candidates > 0 then break end
+                return nil, err, 0
+            end
+
+            for _, s in ipairs(data.data or {}) do
+                scanned = scanned + 1
+                local sid = s.id and tostring(s.id) or nil
+                if sid and sid ~= tostring(game.JobId) then
+                    local playing = s.playing or 0
+                    local maxPlayers = s.maxPlayers or 0
+                    local notFull = (maxPlayers == 0) or (playing < maxPlayers)
+                    if notFull and playing == threshold then
+                        table.insert(candidates, {
+                            id = sid,
+                            playing = playing,
+                            maxPlayers = maxPlayers,
+                            ping = s.ping,
+                        })
+                    end
+                end
+            end
+
+            if #candidates > 0 then
+                break -- đã có ứng viên đạt yêu cầu, khỏi quét thêm
+            end
+
+            cursor = data.nextPageCursor
+            if not cursor or cursor == "" then break end
+            task.wait(CONFIG.PAGE_DELAY)
+        end
+
+        -- Ít người nhất trước, ping thấp hơn làm phụ
+        table.sort(candidates, function(a, b)
+            if a.playing ~= b.playing then
+                return a.playing < b.playing
+            end
+            return (a.ping or 999) < (b.ping or 999)
+        end)
+
+        cache.candidates = candidates
+        cache.threshold = threshold
+        cache.scanned = scanned
+        cache.at = os.clock()
+
+        return candidates, nil, scanned
+    end
+
+    -- // Ngưỡng cố định: từ 3 người trở lên thì tìm server có đúng 1 người.
+    -- Sau khi vào server đó, tổng số người sẽ là 2 (em + 1 người khác).
+    local function getThreshold(_silent)
+        return 1 -- số người mục tiêu trên server đích, không tính người chơi của mình
+    end
+
+    -- // Hop 1 lần
+    local function hopOnce(fromAuto)
+        if hopInProgress then return false end
+
+        local targetPlayers = getThreshold(not fromAuto)
+        if not targetPlayers then return false end
+
+        local remain = CONFIG.HOP_COOLDOWN - (os.clock() - lastHopAttempt)
+        if remain > 0 then
+            if fromAuto then
+                task.wait(remain)
+            else
+                setStatus(("Vừa hop xong — chờ khoảng %.0fs nữa nhé."):format(remain), THEME.WAIT)
+                return false
+end
+        end
+
+        -- Chỉ quét API server khi lần kiểm tra định kỳ thấy có >= 3 người.
+        -- 1 hoặc 2 người: không gọi API, không teleport.
+        local count = playerCount()
+        if count < 3 then
+            setStatus(("✓ Server có %d người — giữ nguyên; chỉ hop khi có từ 3 người."):format(count), THEME.OK)
+            return false
+        end
+
+        local scanWait = nextScanAllowedAt - os.clock()
+        if scanWait > 0 then
+            return false
+        end
+
+        hopInProgress = true
+        lastHopAttempt = os.clock()
+        setStatus(("Server có %d người — đang tìm server có đúng 1 người…"):format(count), THEME.WAIT)
+
+        local candidates, err, scanned = scanServers(targetPlayers, function(msg, color)
+            setStatus(msg, color)
+        end)
+
+        if not candidates then
+            hopInProgress = false
+            nextScanAllowedAt = os.clock() + CONFIG.NO_RESULT_BACKOFF
+            setStatus("Lỗi lấy danh sách server: " .. tostring(err), THEME.ERR)
+            return false
+        end
+
+        if #candidates == 0 then
+            hopInProgress = false
+            nextScanAllowedAt = os.clock() + CONFIG.NO_RESULT_BACKOFF
+            setStatus(("Chưa tìm thấy server có đúng 1 người sau khi quét %d server. Sẽ thử lại theo chu kỳ."):format(scanned), THEME.WAIT)
+            return false
+        end
+
+        local best = candidates[1]
+        setStatus(("🎯 Chọn server tốt nhất: %d/%d người (trong %d server đã quét) — đang hop…"):format(best.playing, best.maxPlayers, scanned), THEME.ACCENT)
+
+        local ok, terr = pcall(function()
+            TeleportService:TeleportToPlaceInstance(PlaceId, best.id, LocalPlayer)
+        end)
+
+        if ok then
+            setStatus(("Đang chuyển tới server %d/%d người… Chúc may mắn! 🌸"):format(best.playing, best.maxPlayers), THEME.OK)
+            return true
+        else
+            hopInProgress = false
+            setStatus("Teleport lỗi: " .. tostring(terr):sub(1, 80), THEME.ERR)
+            return false
+        end
+    end
+
+    -- // Báo lỗi teleport
+    TeleportService.TeleportInitFailed:Connect(function(plr, result, message)
+        if plr == LocalPlayer then
+            hopInProgress = false
+            setStatus("Teleport thất bại (" .. tostring(result.Name) .. ") — có thể thử hop lại.", THEME.ERR)
+        end
+    end)
+
+    -- // Nút Auto Hop (có cờ hủy, bật/tắt nhiều lần không sinh vòng lặp trùng)
+    updateAutoBtn = function()
+        if autoEnabled then
+            AutoBtn.Text = "⏹ Auto Hop: ĐANG BẬT"
+            AutoBtn.BackgroundColor3 = THEME.BTN_AUTO_ON
+        else
+            AutoBtn.Text = "▶ Auto Hop: TẮT"
+            AutoBtn.BackgroundColor3 = THEME.BTN_AUTO_OFF
+        end
+    end
+    updateAutoBtn()
+
+    -- Không có nút bật/tắt: Auto Hop luôn tự khởi chạy.
+    local function startAutoHop()
+        autoEnabled = true
+        autoGen = autoGen + 1
+        local gen = autoGen
+        task.spawn(function()
+            while autoEnabled and gen == autoGen and running and ScreenGui.Parent do
+                hopOnce(true)
+                -- Một lần kiểm tra mỗi 60 giây; không quét danh sách server liên tục.
+                task.wait(CONFIG.AUTO_CHECK_INTERVAL)
+            end
+        end)
+    end
+
+    -- // Nút Hop ngay
+    HopBtn.MouseButton1Click:Connect(function()
+        task.spawn(hopOnce, false)
+    end)
+
+    -- // Nút quét lại
+    RefreshBtn.MouseButton1Click:Connect(function()
+        cache.candidates = nil
+        cache.at = 0
+        setStatus("Đã xóa cache — lần hop tới sẽ quét danh sách mới.", THEME.TEXT_SUB)
+    end)
+
+    -- // Thu nhỏ / Đóng
+    local minimized = false
+    MinBtn.MouseButton1Click:Connect(function()
+        minimized = not minimized
+        Content.Visible = not minimized
+        MainFrame.Size = minimized and CLOSED_SIZE or OPEN_SIZE
+        MinBtn.Text = minimized and "+" or "–"
+    end)
+
+    -- Hộp xác nhận lần hai khi nhấn X.
+    local ConfirmOverlay = make("Frame", {
+        Name = "CloseConfirmOverlay",
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundColor3 = Color3.fromRGB(70, 20, 45),
+        BackgroundTransparency = 0.25,
+        BorderSizePixel = 0,
+        Visible = false,
+        ZIndex = 50,
+    }, MainFrame)
+    corner(16, ConfirmOverlay)
+
+    local ConfirmCard = make("Frame", {
+        Size = UDim2.new(1, -36, 0, 150),
+        Position = UDim2.new(0, 18, 0.5, -75),
+        BackgroundColor3 = THEME.CARD,
+        BorderSizePixel = 0,
+        ZIndex = 51,
+    }, ConfirmOverlay)
+    corner(14, ConfirmCard)
+    stroke(THEME.HEADER_1, 2, ConfirmCard)
+
+    make("TextLabel", {
+        Size = UDim2.new(1, -20, 0, 34),
+        Position = UDim2.new(0, 10, 0, 12),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        Text = "🌸 Xác nhận đóng UI?",
+        TextColor3 = THEME.TEXT_MAIN,
+        TextSize = 17,
+        ZIndex = 52,
+    }, ConfirmCard)
+
+    make("TextLabel", {
+        Size = UDim2.new(1, -24, 0, 36),
+        Position = UDim2.new(0, 12, 0, 47),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham,
+        Text = "Bạn có thể mở lại bằng nút hoa 🌸.",
+        TextColor3 = THEME.TEXT_SUB,
+        TextSize = 12,
+        TextWrapped = true,
+        ZIndex = 52,
+    }, ConfirmCard)
+
+    local ConfirmYes = make("TextButton", {
+        Size = UDim2.new(0.5, -18, 0, 34),
+        Position = UDim2.new(0, 12, 1, -46),
+        BackgroundColor3 = THEME.HEADER_2,
+        BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold,
+        Text = "Đóng",
+        TextColor3 = THEME.WHITE,
+        TextSize = 13,
+        ZIndex = 52,
+    }, ConfirmCard)
+    corner(9, ConfirmYes)
+
+    local ConfirmNo = make("TextButton", {
+        Size = UDim2.new(0.5, -18, 0, 34),
+        Position = UDim2.new(0.5, 6, 1, -46),
+        BackgroundColor3 = Color3.fromRGB(255, 190, 220),
+        BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold,
+        Text = "Hủy",
+        TextColor3 = THEME.TEXT_MAIN,
+        TextSize = 13,
+        ZIndex = 52,
+    }, ConfirmCard)
+    corner(9, ConfirmNo)
+
+    CloseBtn.MouseButton1Click:Connect(function()
+        ConfirmOverlay.Visible = true
+    end)
+
+    ConfirmNo.MouseButton1Click:Connect(function()
+        ConfirmOverlay.Visible = false
+    end)
+
+    ConfirmYes.MouseButton1Click:Connect(function()
+        ConfirmOverlay.Visible = false
+        -- Xác nhận lần hai: ẩn cửa sổ chính, giữ nút hoa để mở lại.
+        autoEnabled = false
+        autoGen = autoGen + 1
+        updateAutoBtn()
+        MainFrame.Visible = false
+    end)
+
+    -- // Vòng đếm người realtime (có điều kiện dừng)
+    task.spawn(function()
+        while running and ScreenGui.Parent do
+            refreshNow()
+            task.wait(CONFIG.AUTO_CHECK_INTERVAL)
+        end
+    end)
+
+    -- // Khởi động
+    refreshNow()
+    setStatus("Chạy nền: kiểm tra mỗi 60 giây; từ 3 người trở lên mới tìm server 1 người.", THEME.ACCENT)
+    -- Tắt toàn bộ ScreenGui: không bảng trạng thái, không nút hoa, không menu.
+    ScreenGui.Enabled = false
+    startAutoHop()
+end
+
+local okMain, errMain = pcall(MAIN)
+if not okMain then
+    GENV.__NUOIBUNG_SVHUB_RUNNING = nil
+    local message = "[nuối bừng SV hub] Lỗi khởi chạy: " .. tostring(errMain)
+    warn(message)
+    -- Dùng thêm thông báo trong game để dễ nhận ra lỗi khởi chạy.
+    pcall(function()
+        game:GetService("StarterGui"):SetCore("SendNotification", {
+            Title = "nuối bừng SV hub",
+            Text = tostring(errMain):sub(1, 180),
+            Duration = 8
+        })
+    end)
+end
